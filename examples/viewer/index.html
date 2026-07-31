@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>vtk2Cesium 体素兼容性探针</title>
+    <link rel="stylesheet" href="https://cdn.jsdmirror.com/npm/cesium@1.143/Build/Cesium/Widgets/widgets.css">
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <main>
+      <section class="panel">
+        <p class="eyebrow">CESIUMJS 1.143 · EXPERIMENTAL VOXELS</p>
+        <h1>vtk2Cesium 兼容性探针</h1>
+        <p id="status" class="status pending">正在加载体素瓦片集…</p>
+        <dl id="details"></dl>
+        <div id="vector-controls" class="controls" hidden></div>
+        <p class="hint">数据路径：<code>../../outputs/probe/tileset.json</code></p>
+      </section>
+      <div id="cesiumContainer" aria-label="Cesium 三维视图"></div>
+    </main>
+    <script src="https://cdn.jsdmirror.com/npm/cesium@1.143/Build/Cesium/Cesium.js"></script>
+    <script src="./viewer.js"></script>
+  </body>
+</html>

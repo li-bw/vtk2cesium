@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+build/
+dist/
+*.egg-info/
+outputs/*
+!outputs/.gitkeep
+
+# Generated large sample/test data (regenerate via samples/generate_*.py)
+samples/*.vti
+
+# WorkBuddy local workspace data (memory, logs, project state)
+.workbuddy/
