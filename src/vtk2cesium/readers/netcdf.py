@@ -38,7 +38,10 @@ from vtk2cesium.readers._common import (
 
 X_NAMES = {"x", "lon", "longitude", "easting", "east", "xc", "lonc", "i"}
 Y_NAMES = {"y", "lat", "latitude", "northing", "north", "yc", "latc", "j"}
-Z_NAMES = {"z", "level", "lev", "levels", "height", "altitude", "depth", "zc", "k"}
+Z_NAMES = {"z", "level", "lev", "levels", "height", "altitude", "depth", "depth_t",
+           "depth_u", "depth_v", "zc", "k", "s_rho", "s_w", "sigma", "eta",
+           "sigma_theta", "plev", "pressure", "isobaric", "isobaric1", "hybrid",
+           "model_level", "model_levels", "nz", "zl"}
 TIME_NAMES = {"time", "t", "datetime", "times", "date", "month", "day",
                "year", "hour", "timestep", "step"}
 
