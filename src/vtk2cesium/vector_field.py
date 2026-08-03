@@ -9,6 +9,8 @@ so the single-scalar production pipeline is unaffected.
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -286,17 +288,317 @@ def build_vector_overlay(
     )
 
 
-def write_vector_overlay(result: VectorOverlayResult, output_directory: str | Path) -> Path:
-    """Write ``arrows.czml`` and ``streamlines.czml`` into ``output_directory``."""
+def _round_packet(packet: dict) -> dict:
+    """Return a shallow copy with ECEF cartesian coordinates rounded to whole metres.
+
+    The full float64 repr is ~20 chars/number; rounding to integer metres shrinks the
+    serialized CZML by ~2x with sub-metre accuracy that is irrelevant at scene scale.
+    """
+
+    packet = dict(packet)
+    positions = dict(packet["polyline"]["positions"])
+    positions["cartesian"] = [int(round(float(coord))) for coord in positions["cartesian"]]
+    polyline = dict(packet["polyline"])
+    polyline["positions"] = positions
+    packet["polyline"] = polyline
+    return packet
+
+
+def _document_packet(name: str) -> dict:
+    """Return the CZML ``document`` packet every stream must start with.
+
+    CesiumJS rejects a CZML stream whose first packet is not the document object
+    ("first CZML packet is required to be the document object"), so each shard needs
+    its own copy -- a shard is loaded as an independent CZML stream.
+    """
+
+    return {"id": "document", "name": name, "version": "1.0"}
+
+
+def _shard_packets(packets: list[dict], name: str, max_bytes: int = 48000) -> list[list[dict]]:
+    """Split packets into shards whose JSON serialization stays under ``max_bytes``.
+
+    Every arrow/streamline is preserved (no data loss); only the on-disk file size is
+    bounded so the overlay still loads through transports that cap response bodies
+    (e.g. 64 KiB sandboxes / preview proxies). Each shard is prefixed with its own
+    ``document`` packet so it is a valid standalone CZML stream.
+    """
+
+    document = _document_packet(name)
+    document_size = len(json.dumps(document, ensure_ascii=False))
+    shards: list[list[dict]] = []
+    current: list[dict] = [document]
+    current_size = 2 + document_size  # surrounding "[]" plus the document packet
+    for packet in packets:
+        size = len(json.dumps(packet, ensure_ascii=False))
+        if len(current) > 1 and current_size + size > max_bytes:
+            shards.append(current)
+            current = [dict(document)]
+            current_size = 2 + document_size
+        current.append(packet)
+        current_size += size
+    if len(current) > 1:
+        shards.append(current)
+    return shards
+
+
+def write_vector_overlay(
+    result: VectorOverlayResult,
+    output_directory: str | Path,
+    max_shard_bytes: int = 48000,
+) -> Path:
+    """Write the overlay as shard files + a manifest into ``output_directory``.
+
+    Instead of two potentially huge ``arrows.czml`` / ``streamlines.czml`` files, the
+    packets are split into ``arrows-<i>.czml`` / ``streamlines-<i>.czml`` shards (each
+    well under common 64 KiB transport caps) plus a ``vectors-manifest.json`` listing
+    them. Every shard starts with its own ``document`` packet, so each one is a valid
+    standalone CZML stream. The viewer loads every shard through the manifest, so
+    nothing is lost and the overlay renders identically regardless of body limits.
+    """
 
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
-    import json
 
-    (directory / "arrows.czml").write_text(
-        json.dumps(list(result.arrow_packets), ensure_ascii=False), encoding="utf-8"
-    )
-    (directory / "streamlines.czml").write_text(
-        json.dumps(list(result.streamline_packets), ensure_ascii=False), encoding="utf-8"
+    arrow_packets = [_round_packet(p) for p in result.arrow_packets]
+    stream_packets = [_round_packet(p) for p in result.streamline_packets]
+
+    arrow_shards = _shard_packets(arrow_packets, "vtk2cesium arrows", max_shard_bytes)
+    stream_shards = _shard_packets(stream_packets, "vtk2cesium streamlines", max_shard_bytes)
+
+    manifest = {
+        "arrow_count": result.arrow_count,
+        "streamline_count": result.streamline_count,
+        "speed_min": result.speed_min,
+        "speed_max": result.speed_max,
+        "arrows": [],
+        "streamlines": [],
+    }
+    for index, shard in enumerate(arrow_shards):
+        name = f"arrows-{index}.czml"
+        (directory / name).write_text(json.dumps(shard, ensure_ascii=False), encoding="utf-8")
+        manifest["arrows"].append(name)
+    for index, shard in enumerate(stream_shards):
+        name = f"streamlines-{index}.czml"
+        (directory / name).write_text(json.dumps(shard, ensure_ascii=False), encoding="utf-8")
+        manifest["streamlines"].append(name)
+    (directory / "vectors-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
     return directory
+
+
+# --------------------------------------------------------------------------- #
+# Velocity field export (Tier-3 particle wind) — decoupled sampler data.
+# --------------------------------------------------------------------------- #
+#
+# The particle layer (``WindParticles.js``) needs the raw u/v/w field on a
+# regular grid so it can advect particles in the browser. We emit the *same*
+# ENU coordinate space the arrows use (``origin`` + grid index * ``spacing``),
+# so a particle at ENU ``p`` samples the field and is transformed to ECEF with
+# the same ``GeoReference``. Nothing here touches ``convert`` / the voxel GLB.
+#
+# Files are sharded (z/y blocks) so every shard stays under common 64 KiB
+# transport caps, exactly like the CZML overlay. The viewer assembles the
+# shards back into one field via ``velocity-field-manifest.json``.
+
+
+@dataclass(frozen=True)
+class VelocityFieldResult:
+    """Regular-grid velocity field for browser-side particle advection."""
+
+    dimensions: tuple[int, int, int]
+    origin: tuple[float, float, float]
+    spacing: tuple[float, float, float]
+    u: Float64Array
+    v: Float64Array
+    w: Float64Array
+    speed_min: float
+    speed_max: float
+
+
+def build_velocity_field(
+    dataset: StructuredVoxelDataset,
+    *,
+    u_name: str,
+    v_name: str,
+    w_name: str,
+    field_step: int = 8,
+) -> VelocityFieldResult:
+    """Downsample the u/v/w components onto a coarse regular grid.
+
+    ``field_step`` is the stride through the original VTI grid; the emitted grid
+    has ``ceil(n / field_step)`` cells per axis, with ``spacing`` scaled by the
+    same stride. Index ``(i, j, k)`` maps to ENU ``origin + (i*dx, j*dy, k*dz)``
+    — identical to the arrow base points — and the flat array order is
+    ``index = i + j*nx + k*nx*ny`` (i fastest), matching C-order flattening.
+    """
+
+    nx, ny, nz = dataset.point_dimensions
+    step = max(1, int(field_step))
+    fx = (nx + step - 1) // step
+    fy = (ny + step - 1) // step
+    fz = (nz + step - 1) // step
+    origin = tuple(float(coord) for coord in dataset.origin)
+    spacing = (
+        float(dataset.spacing[0]) * step,
+        float(dataset.spacing[1]) * step,
+        float(dataset.spacing[2]) * step,
+    )
+
+    u_field = dataset.field(u_name).values
+    v_field = dataset.field(v_name).values
+    w_field = dataset.field(w_name).values
+
+    u = np.empty(fx * fy * fz, dtype=np.float64)
+    v = np.empty(fx * fy * fz, dtype=np.float64)
+    w = np.empty(fx * fy * fz, dtype=np.float64)
+    speed_min = math.inf
+    speed_max = -math.inf
+    for ki in range(fz):
+        k = min(ki * step, nz - 1)
+        for jj in range(fy):
+            j = min(jj * step, ny - 1)
+            for ii in range(fx):
+                i = min(ii * step, nx - 1)
+                idx = ii + jj * fx + ki * fx * fy
+                uu = float(u_field[k, j, i])
+                vv = float(v_field[k, j, i])
+                ww = float(w_field[k, j, i])
+                u[idx] = uu
+                v[idx] = vv
+                w[idx] = ww
+                sp = math.sqrt(uu * uu + vv * vv + ww * ww)
+                if sp < speed_min:
+                    speed_min = sp
+                if sp > speed_max:
+                    speed_max = sp
+    if not math.isfinite(speed_min):
+        speed_min, speed_max = 0.0, 1.0
+    return VelocityFieldResult(
+        dimensions=(fx, fy, fz),
+        origin=origin,
+        spacing=spacing,
+        u=u,
+        v=v,
+        w=w,
+        speed_min=float(speed_min),
+        speed_max=float(speed_max),
+    )
+
+
+def _velocity_field_blocks(nx: int, ny: int, nz: int, max_bytes: int) -> list[tuple[int, int, int, int]]:
+    """Return (zStart, zCount, yStart, yCount) blocks covering the grid.
+
+    Each block is kept under ``max_bytes`` by first taking whole-y z-bands and,
+    only when a single z-slab is itself too large, splitting that slab along y.
+    """
+
+    bytes_per_cell = 3 * 9  # u/v/w floats, ~9 chars each, rough upper bound
+    budget = max_bytes * 0.7
+    blocks: list[tuple[int, int, int, int]] = []
+    z = 0
+    while z < nz:
+        # Largest z-band whose full-y block still fits the budget.
+        max_z_full_y = budget / (ny * nx * bytes_per_cell)
+        z_count = max(1, int(max_z_full_y))
+        z_count = min(z_count, nz - z)
+        if nx * ny * z_count * bytes_per_cell <= budget:
+            blocks.append((z, z_count, 0, ny))
+            z += z_count
+            continue
+        # This z-slab alone is too big: split along y.
+        y = 0
+        while y < ny:
+            y_count = max(1, int(budget / (nx * z_count * bytes_per_cell)))
+            y_count = min(y_count, ny - y)
+            blocks.append((z, z_count, y, y_count))
+            y += y_count
+        z += z_count
+    return blocks
+
+
+def write_velocity_field(
+    result: VelocityFieldResult,
+    georeference: GeoReference,
+    output_directory: str | Path,
+    max_shard_bytes: int = 48000,
+) -> Path:
+    """Write the velocity field as z/y-blocked shards + a manifest.
+
+    The viewer (``WindParticles.js``) loads every shard through
+    ``velocity-field-manifest.json`` and reassembles one ``(nx*ny*nz)`` field,
+    so the particle advection works regardless of the 64 KiB transport cap.
+    """
+
+    directory = Path(output_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    nx, ny, nz = result.dimensions
+    georef = {
+        "longitude": georeference.longitude,
+        "latitude": georeference.latitude,
+        "height": georeference.height,
+    }
+    blocks = _velocity_field_blocks(nx, ny, nz, max_shard_bytes)
+
+    shard_names: list[str] = []
+    for index, (z_start, z_count, y_start, y_count) in enumerate(blocks):
+        u_part = _extract_block(result.u, nx, ny, nz, z_start, z_count, y_start, y_count)
+        v_part = _extract_block(result.v, nx, ny, nz, z_start, z_count, y_start, y_count)
+        w_part = _extract_block(result.w, nx, ny, nz, z_start, z_count, y_start, y_count)
+        shard = {
+            "nx": nx,
+            "ny": ny,
+            "nz": nz,
+            "zStart": z_start,
+            "zCount": z_count,
+            "yStart": y_start,
+            "yCount": y_count,
+            "origin": list(result.origin),
+            "spacing": list(result.spacing),
+            "georeference": georef,
+            "speed_min": result.speed_min,
+            "speed_max": result.speed_max,
+            "u": [round(float(x), 3) for x in u_part],
+            "v": [round(float(x), 3) for x in v_part],
+            "w": [round(float(x), 3) for x in w_part],
+        }
+        name = f"velocity-field-{index}.json"
+        (directory / name).write_text(json.dumps(shard, ensure_ascii=False), encoding="utf-8")
+        shard_names.append(name)
+
+    manifest = {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "origin": list(result.origin),
+        "spacing": list(result.spacing),
+        "georeference": georef,
+        "speed_min": result.speed_min,
+        "speed_max": result.speed_max,
+        "shards": shard_names,
+    }
+    (directory / "velocity-field-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    return directory
+
+
+def _extract_block(
+    array: Float64Array,
+    nx: int,
+    ny: int,
+    nz: int,
+    z_start: int,
+    z_count: int,
+    y_start: int,
+    y_count: int,
+) -> list[float]:
+    """Pull a contiguous (y, z) sub-block (full x) out of the flat field."""
+
+    out: list[float] = []
+    for k in range(z_start, z_start + z_count):
+        for j in range(y_start, y_start + y_count):
+            start = j * nx + k * nx * ny
+            out.extend(float(x) for x in array[start : start + nx])
+    return out

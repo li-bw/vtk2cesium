@@ -1,0 +1,32 @@
+# VTK2Cesium 统一管线配置（端到端 run 用）。
+# 关键：georeference 只写一次，convert 与 vector 共用，避免两处 --lon/--lat/--height 不一致。
+# 相对路径相对于本配置文件所在目录（examples/）解析。
+
+input: ../samples/wind_lixia.vti        # 原始 VTI（含 u/v/w/speed/temperature）
+output: ../outputs/wind-lixia-run        # 自包含输出目录（体素 + 矢量 + 查看器）
+
+georeference:                           # ENU->ECEF 锚点（体素与矢量必须一致）
+  longitude: 117.07
+  latitude: 36.66
+  height: 0.0
+
+field_name: speed                       # 写入体素的标量属性
+association: point
+
+# 瓦片 / LOD 结构（不影响最细体素尺寸，只影响切分与层数）
+tiling:
+  available_levels: 4
+
+# 矢量叠加层（箭头 / 流线 / 粒子速度场），完全解耦
+vector:
+  field_u: u
+  field_v: v
+  field_w: w
+  step: 8                              # 箭头/流线降采样步长
+  arrow_length: 400                    # 箭头长度（米）
+  streamlines: 150                     # 流线数量
+  streamline_steps: 50
+  streamline_step: 250                 # 每步米数
+  seed: 0
+  emit_field: true                     # 导出速度场 JSON（供粒子风场）
+  field_step: 8                        # 速度场降采样步长

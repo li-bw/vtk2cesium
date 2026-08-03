@@ -113,3 +113,77 @@ class ConvertConfig(BaseModel):
         data = self.model_dump()
         data.update({key: value for key, value in overrides.items() if value is not None})
         return type(self).model_validate(data)
+
+
+class VectorConfig(BaseModel):
+    """Velocity-vector overlay parameters; shares the voxel georeference."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field_u: str = "u"
+    field_v: str = "v"
+    field_w: str = "w"
+    step: int | tuple[int, int, int] | None = None
+    arrow_length: float = 400.0
+    streamlines: int = 150
+    streamline_steps: int = 50
+    streamline_step: float = 250.0
+    seed: int = 0
+    emit_field: bool = True
+    field_step: int = 8
+
+
+class PipelineConfig(BaseModel):
+    """Unified pipeline configuration reused by ``run`` and ``vector --config``.
+
+    A single ``georeference`` drives both the voxel tileset and the decoupled
+    vector overlay, eliminating the manual ``--lon/--lat/--height`` duplication
+    that previously had to stay in sync across two commands.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input: Path
+    output: Path
+    georeference: GeoReferenceConfig
+    field_name: str = Field(default="density", min_length=1)
+    association: ScalarAssociation | None = None
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
+    tiling: TilingConfig | None = None
+    vector: VectorConfig = Field(default_factory=VectorConfig)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "PipelineConfig":
+        """Load YAML and resolve relative input/output paths from its directory."""
+
+        config_path = Path(path).expanduser().resolve()
+        try:
+            document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"configuration file does not exist: {config_path}") from error
+        except yaml.YAMLError as error:
+            raise ValueError(f"invalid YAML configuration: {error}") from error
+        if not isinstance(document, dict):
+            raise ValueError("configuration root must be a mapping")
+        data = dict(document)
+        for key in ("input", "output"):
+            if key in data:
+                value = Path(data[key]).expanduser()
+                if not value.is_absolute():
+                    value = config_path.parent / value
+                data[key] = value.resolve()
+        return cls.model_validate(data)
+
+    def convert_config(self, *, overwrite: bool = False) -> ConvertConfig:
+        """Project the convert-relevant subset into a ``ConvertConfig``."""
+
+        return ConvertConfig(
+            input=self.input,
+            output=self.output,
+            field_name=self.field_name,
+            association=self.association,
+            georeference=self.georeference,
+            preprocess=self.preprocess,
+            tiling=self.tiling,
+            overwrite=overwrite,
+        )

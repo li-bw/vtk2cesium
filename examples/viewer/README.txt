@@ -18,3 +18,13 @@ http://localhost:8000/examples/viewer/?tileset=../../outputs/at-stage4-cli/tiles
 重要：不要把地理定位 tileset 与局部 modelMatrix 同时应用，否则会双重变换、体素被甩到太空。
 
 验收页使用无需 Cesium ion token 的 OpenStreetMap 在线底图。不要把个人 token 写入源码或提交到版本库。
+
+矢量叠加层（箭头 / 流线）目录写死在 viewer.js 顶部的 DEFAULT_VECTORS_BASE：
+  ../../outputs/wind-lixia-vectors      <- vector 命令的默认输出位置
+换目录用 ?vectors=<目录>；?vectors=0 或 ?vectors=off 关闭叠加层。
+
+风场体素 + 矢量叠加：
+http://localhost:8000/examples/viewer/?tileset=../../outputs/wind-lixia-stage5/tileset.json
+
+加载失败时详情面板会显示确切的 URL 和 HTTP 状态码。地质体样本没有 u/v/w，
+没有对应矢量产物，用它做底图时加 ?vectors=off。

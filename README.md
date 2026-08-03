@@ -293,10 +293,17 @@ vtk2cesium vector "samples\wind_lixia.vti" "outputs\wind-lixia-vectors" `
 ```
 
 - `--step`（默认 16，或 `x,y,z`）控制箭头降采样步长；`--arrow-length` 为箭头长度（米）；`--streamlines`/`--streamline-steps`/`--streamline-step` 控制流线种子数、步数、步长。
-- 输出 `arrows.czml` 与 `streamlines.czml`，位置均为 ECEF cartesian、按风速着色（蓝→红），`arcType: NONE` 保证是 3D 直线段。
+- 输出按 ~48 KB 分片的 `arrows-<i>.czml` / `streamlines-<i>.czml` 加一份 `vectors-manifest.json` 索引；位置均为 ECEF cartesian、按风速着色（蓝→红），`arcType: NONE` 保证是 3D 直线段。分片是为了绕开某些静态服务器/预览代理对响应体的 64 KiB 上限（大文件会被截断成残缺 JSON），全部箭头与流线无损保留。
 - 单标量 `convert` 路径完全不变；`vector` 是独立的 CLI 子命令，复用 `geo.GeoReference` 但不触碰体素 GLB/tileset 写入器。
 
-查看页（`examples/viewer/`）自动加载叠加层：打开风场 tileset 时默认指向 `outputs/wind-lixia-vectors`，面板出现「箭头 glyph / 流线」两个开关；其它 tileset 需显式 `?vectors=<目录>`。验证：箭头基点 ECEF 与体素 transform 误差 **0.0 m**，全部落进球素根盒内。
+查看页（`examples/viewer/`）的叠加层目录写死为默认值 `../../outputs/wind-lixia-vectors`（`viewer.js` 顶部的 `DEFAULT_VECTORS_BASE`），即 `vector` 命令的默认输出位置：
+
+- `?vectors=<目录>` 换成别的矢量产物目录；
+- `?vectors=0` 或 `?vectors=off` 关闭叠加层。
+
+加载 `vectors-manifest.json` 列出的全部分片（旧的单文件 `arrows.czml` / `streamlines.czml` 仍作兜底），面板出现「箭头 glyph / 流线」两个开关——每组一个开关，分片对用户不可见。详情面板的 `Vectors base` 显示实际使用的目录；加载失败时直接列出确切的 URL 与 HTTP 状态码，便于定位路径问题。
+
+注意矢量目录必须与体素 tileset 用**同一套** `--lon/--lat/--height`，否则两者不重合。地质体样本只有 `density`/`porosity`、没有 `u/v/w`，因此没有对应的矢量叠加，用它做底图时需要 `?vectors=off`。验证：箭头基点 ECEF 与体素 transform 误差 **0.0 m**，全部落进球素根盒内。
 
 ## 兼容约定
 
