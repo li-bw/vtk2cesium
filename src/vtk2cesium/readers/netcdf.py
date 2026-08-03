@@ -39,7 +39,8 @@ from vtk2cesium.readers._common import (
 X_NAMES = {"x", "lon", "longitude", "easting", "east", "xc", "lonc", "i"}
 Y_NAMES = {"y", "lat", "latitude", "northing", "north", "yc", "latc", "j"}
 Z_NAMES = {"z", "level", "lev", "levels", "height", "altitude", "depth", "zc", "k"}
-TIME_NAMES = {"time", "t", "datetime", "times"}
+TIME_NAMES = {"time", "t", "datetime", "times", "date", "month", "day",
+               "year", "hour", "timestep", "step"}
 
 # Coordinate names that are unambiguously angular degrees even without a units
 # attribute (CF convention relies on units, but many files omit them).
