@@ -9,7 +9,7 @@ from typing import Any
 from vtk2cesium.config import ConvertConfig
 from vtk2cesium.geo import GeoReference
 from vtk2cesium.model import VtiInspection
-from vtk2cesium.readers import inspect_vti, read_vti
+from vtk2cesium.readers import inspect_dataset, read_dataset
 from vtk2cesium.validate import ValidationResult, validate_probe
 from vtk2cesium.writer import write_voxel_tileset
 
@@ -34,22 +34,23 @@ class ConversionResult:
         return document
 
 
-def inspect_vtk(path: str | Path) -> VtiInspection:
-    """Inspect a supported VTK file without selecting a conversion field."""
+def inspect_vtk(path: str | Path, *, reader: Any = None) -> VtiInspection:
+    """Inspect a supported input file (VTI/NetCDF/GeoTIFF) without selecting a field."""
 
-    input_path = Path(path)
-    if input_path.suffix.lower() != ".vti":
-        raise ValueError("stage-4 inspect supports .vti input only")
-    return inspect_vti(input_path)
+    return inspect_dataset(Path(path), reader=reader)
 
 
 def convert_vti(config: ConvertConfig) -> ConversionResult:
-    """Convert one configured VTI field and validate the completed output."""
+    """Convert one configured field and validate the completed output.
 
-    dataset = read_vti(
+    Supports VTI, NetCDF, and GeoTIFF inputs through the unified reader.
+    """
+
+    dataset = read_dataset(
         config.input,
         field_name=config.field_name,
         association=config.association,
+        reader=config.reader,
     )
     georeference = GeoReference(
         config.georeference.longitude,

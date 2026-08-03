@@ -293,7 +293,7 @@ vtk2cesium vector "samples\wind_lixia.vti" "outputs\wind-lixia-vectors" `
 ```
 
 - `--step`（默认 16，或 `x,y,z`）控制箭头降采样步长；`--arrow-length` 为箭头长度（米）；`--streamlines`/`--streamline-steps`/`--streamline-step` 控制流线种子数、步数、步长。
-- 输出按 ~48 KB 分片的 `arrows-<i>.czml` / `streamlines-<i>.czml` 加一份 `vectors-manifest.json` 索引；位置均为 ECEF cartesian、按风速着色（蓝→红），`arcType: NONE` 保证是 3D 直线段。分片是为了绕开某些静态服务器/预览代理对响应体的 64 KiB 上限（大文件会被截断成残缺 JSON），全部箭头与流线无损保留。
+- 输出按较小体积分片的 `arrows-<i>.czml` / `streamlines-<i>.czml` 加一份 `vectors-manifest.json` 索引；位置均为 ECEF cartesian、按风速着色（蓝→红），`arcType: NONE` 保证是 3D 直线段。分片用于支持并行加载、渐进显示，并让单个分片便于缓存，全部箭头与流线无损保留。
 - 单标量 `convert` 路径完全不变；`vector` 是独立的 CLI 子命令，复用 `geo.GeoReference` 但不触碰体素 GLB/tileset 写入器。
 
 查看页（`examples/viewer/`）的叠加层目录写死为默认值 `../../outputs/wind-lixia-vectors`（`viewer.js` 顶部的 `DEFAULT_VECTORS_BASE`），即 `vector` 命令的默认输出位置：
@@ -304,6 +304,74 @@ vtk2cesium vector "samples\wind_lixia.vti" "outputs\wind-lixia-vectors" `
 加载 `vectors-manifest.json` 列出的全部分片（旧的单文件 `arrows.czml` / `streamlines.czml` 仍作兜底），面板出现「箭头 glyph / 流线」两个开关——每组一个开关，分片对用户不可见。详情面板的 `Vectors base` 显示实际使用的目录；加载失败时直接列出确切的 URL 与 HTTP 状态码，便于定位路径问题。
 
 注意矢量目录必须与体素 tileset 用**同一套** `--lon/--lat/--height`，否则两者不重合。地质体样本只有 `density`/`porosity`、没有 `u/v/w`，因此没有对应的矢量叠加，用它做底图时需要 `?vectors=off`。验证：箭头基点 ECEF 与体素 transform 误差 **0.0 m**，全部落进球素根盒内。
+
+## 阶段 7：非 VTK 数据源（NetCDF / GeoTIFF）
+
+除了 VTK `.vti`，管线现在支持更通用的科学网格格式。统一的 `read_dataset` / `inspect_dataset` 入口按文件后缀自动路由到对应适配器，所有适配器输出同一份契约：**本地 ENU 米制帧**，`origin` 为西南下角 `(0,0,0)`，`spacing` 为每轴格距，字段值统一为 `(z, y, x[, components])`。后期地理定位（`geo.GeoReference`）把本地 `origin` 锚定到地球，因此适配器本身不需要 WGS84 坐标。
+
+| 后缀 | 适配器 | 数据形态 |
+| --- | --- | --- |
+| `.vti` | VTK | 原有点/单元标量、矢量 |
+| `.nc` / `.nc4` / `.cdf` | NetCDF | 2D/3D 网格变量，如 `(time, level, lat, lon)` |
+| `.tif` / `.tiff` | GeoTIFF | 2D 多波段栅格（DEM、遥感波段） |
+
+可选依赖采用**惰性导入**：只有用到对应格式时才导入，缺失 `netCDF4` / `rasterio` 不影响 `.vti` 路径，并会给出清晰的安装提示。
+
+```powershell
+pip install netCDF4 rasterio
+```
+
+### NetCDF
+
+维度按名称识别：`x`←{x, lon, longitude, easting, …}，`y`←{y, lat, latitude, northing, …}，`z`←{z, level, height, depth, …}；其余非空间维（如 `time`）被丢弃（取第 0 片）；一个未识别的非时间维会被当作末尾分量轴（如矢量分量）。坐标变量给出各轴位置，其 delta 即格距（米）；角度坐标（`lon`/`lat`，带 `units` 或名字为 lon/lat）按参考纬度换算成米；缺失坐标变量则按单位 1 m 索引。
+
+```powershell
+vtk2cesium inspect "data.nc" --reference-latitude 36.15
+
+vtk2cesium convert "data.nc" "outputs\nc-stage5" `
+  --field temp --lon 117.07 --lat 36.66 --height 0 `
+  --reference-latitude 36.15 --mapping linear --available-levels 3
+```
+
+- 多字段文件必须显式 `--field`；单字段可省略（自动选）。
+- 若维度名不在识别集合内，用 `--x-dim/--y-dim/--z-dim` 显式指定。
+- 参考纬度优先取 `--reference-latitude`；省略时取 y 坐标均值（无则 0）。
+
+YAML 中用 `reader:` 块携带这些提示，CLI 与 `run` 子命令同样支持 `--reference-latitude/--x-dim/--y-dim/--z-dim` 覆盖：
+
+```yaml
+input: data.nc
+output: outputs/nc-stage5
+field_name: temp
+georeference:
+  longitude: 117.07
+  latitude: 36.66
+  height: 0
+preprocess:
+  mapping: linear
+reader:
+  reference_latitude: 36.15
+```
+
+### GeoTIFF
+
+用 `rasterio` 读取，每个波段成为一个标量字段（名默认 `band_N`，可用 `dataset.set_band_description` 命名）；栅格行翻转使 ENU `y` 向北递增；结果只有单层（`nz = 1`）。geotransform 给出 `origin`/`spacing`：投影 CRS（米）直接用，地理 CRS（度）按参考纬度换算成米。
+
+```powershell
+vtk2cesium inspect "dem.tif" --reference-latitude 36.15
+
+vtk2cesium convert "dem.tif" "outputs\dem-stage5" `
+  --lon 117.0 --lat 36.6 --height 0 --mapping linear --available-levels 3
+```
+
+- 地理定位的 `--lon/--lat` 应指向栅格的**西南角**（本地 `origin` = 西南下角）。
+- 多波段若要合并成单分量场，在 YAML 中设 `reader.band_as_field: false`；默认每波段一个字段。CLI 暂未暴露该开关。
+
+### 限制
+
+- 2D GeoTIFF 会被压成单层体素（`nz = 1`），垂直方向没有真实几何意义。
+- NetCDF 的垂直坐标原样当作米制格距：若原始 `level`/`height` 是气压（hPa）或指数层，需先做垂直坐标换算，或把每层 2D 切片当成独立输入。
+- 非规则（曲线）网格请先插值到结构化网格再喂入。
 
 ## 兼容约定
 

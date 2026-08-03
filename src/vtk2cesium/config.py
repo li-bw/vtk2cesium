@@ -11,6 +11,8 @@ import yaml
 from vtk2cesium.model import ScalarAssociation
 from vtk2cesium.transfer import NonFinitePolicy, ScalarMapping, ScalarPreprocessConfig
 
+SUPPORTED_INPUT_SUFFIXES = frozenset({".vti", ".nc", ".nc4", ".cdf", ".tif", ".tiff"})
+
 
 class GeoReferenceConfig(BaseModel):
     """Explicit WGS84 anchor for a local ENU VTK data set."""
@@ -20,6 +22,24 @@ class GeoReferenceConfig(BaseModel):
     longitude: float = Field(ge=-180.0, le=180.0)
     latitude: float = Field(ge=-90.0, le=90.0)
     height: float = 0.0
+
+
+class ReaderConfig(BaseModel):
+    """Optional, format-specific hints for the non-VTI (NetCDF/GeoTIFF) adapters.
+
+    ``reference_latitude`` converts angular ``lon``/``lat`` coordinates (and
+    geographic-CRS GeoTIFFs) to metres; ``x_dim``/``y_dim``/``z_dim`` override the
+    automatic NetCDF axis detection; ``band_as_field`` keeps GeoTIFF bands as
+    separate scalar fields.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reference_latitude: float | None = None
+    x_dim: str | None = None
+    y_dim: str | None = None
+    z_dim: str | None = None
+    band_as_field: bool = True
 
 
 class PreprocessConfig(BaseModel):
@@ -64,7 +84,7 @@ class TilingConfig(BaseModel):
 
 
 class ConvertConfig(BaseModel):
-    """Complete SDK/CLI configuration for one VTI conversion."""
+    """Complete SDK/CLI configuration for one VTI/NetCDF/GeoTIFF conversion."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -75,12 +95,15 @@ class ConvertConfig(BaseModel):
     georeference: GeoReferenceConfig
     preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     tiling: TilingConfig | None = None
+    reader: ReaderConfig | None = None
     overwrite: bool = False
 
     @model_validator(mode="after")
     def validate_paths(self) -> "ConvertConfig":
-        if self.input.suffix.lower() != ".vti":
-            raise ValueError("input must be a .vti file")
+        if self.input.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+            raise ValueError(
+                f"input must be one of {', '.join(sorted(SUPPORTED_INPUT_SUFFIXES))}; got {self.input.suffix}"
+            )
         if self.output == self.input:
             raise ValueError("output must differ from input")
         return self
@@ -131,6 +154,7 @@ class VectorConfig(BaseModel):
     seed: int = 0
     emit_field: bool = True
     field_step: int = 8
+    reader: ReaderConfig | None = None
 
 
 class PipelineConfig(BaseModel):
@@ -150,6 +174,7 @@ class PipelineConfig(BaseModel):
     association: ScalarAssociation | None = None
     preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
     tiling: TilingConfig | None = None
+    reader: ReaderConfig | None = None
     vector: VectorConfig = Field(default_factory=VectorConfig)
 
     @classmethod
@@ -185,5 +210,13 @@ class PipelineConfig(BaseModel):
             georeference=self.georeference,
             preprocess=self.preprocess,
             tiling=self.tiling,
+            reader=self.reader,
             overwrite=overwrite,
         )
+
+    def with_reader(self, reader: ReaderConfig) -> "PipelineConfig":
+        """Return a copy with the reader hints replaced (CLI override of YAML)."""
+
+        data = self.model_dump()
+        data["reader"] = reader.model_dump()
+        return type(self).model_validate(data)

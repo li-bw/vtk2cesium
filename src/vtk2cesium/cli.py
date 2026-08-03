@@ -17,13 +17,14 @@ from vtk2cesium.config import (
     GeoReferenceConfig,
     PipelineConfig,
     PreprocessConfig,
+    ReaderConfig,
     TilingConfig,
     VectorConfig,
 )
 from vtk2cesium.model import ScalarAssociation, StructuredVoxelDataset
 from vtk2cesium.geo import GeoReference
 from vtk2cesium.pipeline import convert_vti, inspect_vtk, validate_output
-from vtk2cesium.readers.vti import read_vti
+from vtk2cesium.readers import read_dataset
 from vtk2cesium.transfer import NonFinitePolicy, ScalarMapping
 from vtk2cesium.vector_field import build_vector_overlay, write_vector_overlay
 
@@ -56,12 +57,16 @@ def _fail(message: str, code: int) -> None:
 @app.command("inspect")
 def inspect_command(
     input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+    reference_latitude: Annotated[float | None, typer.Option("--reference-latitude", help="Reference latitude (deg) for lon->metre conversion in NetCDF/GeoTIFF.")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
 ) -> None:
-    """Inspect VTI geometry, fields, ranges, and estimated scalar memory."""
+    """Inspect VTI/NetCDF/GeoTIFF geometry, fields, ranges, and estimated memory."""
 
     try:
-        inspection = inspect_vtk(input_path)
+        inspection = inspect_vtk(
+            input_path,
+            reader=ReaderConfig(reference_latitude=reference_latitude) if reference_latitude is not None else None,
+        )
     except (OSError, ValueError) as error:
         _fail(str(error), EXIT_INPUT)
     fields = []
@@ -125,6 +130,10 @@ def convert_command(
     source_max: Annotated[float | None, typer.Option("--source-max")] = None,
     non_finite: Annotated[str | None, typer.Option("--non-finite")] = None,
     fill_value: Annotated[float | None, typer.Option("--fill-value")] = None,
+    reference_latitude: Annotated[float | None, typer.Option("--reference-latitude", help="Reference latitude (deg) for lon->metre conversion.")] = None,
+    x_dim: Annotated[str | None, typer.Option("--x-dim", help="Explicit NetCDF x-axis dimension name.")] = None,
+    y_dim: Annotated[str | None, typer.Option("--y-dim", help="Explicit NetCDF y-axis dimension name.")] = None,
+    z_dim: Annotated[str | None, typer.Option("--z-dim", help="Explicit NetCDF z-axis dimension name.")] = None,
     available_levels: Annotated[int | None, typer.Option("--available-levels")] = None,
     tile_dimensions: Annotated[str | None, typer.Option("--tile-dimensions")] = None,
     overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
@@ -152,6 +161,10 @@ def convert_command(
             source_max=source_max,
             non_finite=non_finite,
             fill_value=fill_value,
+            reference_latitude=reference_latitude,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            z_dim=z_dim,
             available_levels=available_levels,
             tile_dimensions=tile_dimensions,
             overwrite=overwrite,
@@ -217,12 +230,16 @@ def vector_command(
     overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
     emit_field: Annotated[bool | None, typer.Option("--emit-field/--no-emit-field")] = None,
     field_step: Annotated[int | None, typer.Option("--field-step")] = None,
+    reference_latitude: Annotated[float | None, typer.Option("--reference-latitude", help="Reference latitude (deg) for lon->metre conversion (NetCDF/GeoTIFF).")] = None,
+    x_dim: Annotated[str | None, typer.Option("--x-dim")] = None,
+    y_dim: Annotated[str | None, typer.Option("--y-dim")] = None,
+    z_dim: Annotated[str | None, typer.Option("--z-dim")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """Build a decoupled CZML vector overlay (arrows + streamlines) from u/v/w.
 
-    This is fully independent of ``convert``: it reads the original VTI velocity
-    components, downsamples them, and writes sharded ``arrows-<i>.czml`` /
+    This is fully independent of ``convert``: it reads the original VTI/NetCDF/GeoTIFF
+    velocity components, downsamples them, and writes sharded ``arrows-<i>.czml`` /
     ``streamlines-<i>.czml`` files plus a ``vectors-manifest.json`` (each shard stays
     under common 64 KiB transport caps) georeferenced with the same ENU->ECEF transform
     as the voxel tileset.
@@ -256,6 +273,10 @@ def vector_command(
         seed=seed,
         emit_field=emit_field,
         field_step=field_step,
+        reference_latitude=reference_latitude,
+        x_dim=x_dim,
+        y_dim=y_dim,
+        z_dim=z_dim,
     )
 
     document = _run_vector(**resolved, overwrite=overwrite)
@@ -293,6 +314,10 @@ def _resolve_vector_args(
     seed: int | None,
     emit_field: bool | None,
     field_step: int | None,
+    reference_latitude: float | None = None,
+    x_dim: str | None = None,
+    y_dim: str | None = None,
+    z_dim: str | None = None,
 ) -> dict:
     """Merge CLI overrides onto a pipeline config (or built-in defaults)."""
 
@@ -337,6 +362,17 @@ def _resolve_vector_args(
             EXIT_USAGE,
         )
 
+    # Reader hints: CLI wins; otherwise the shared pipeline vector reader.
+    cli_reader = None
+    if any(v is not None for v in (reference_latitude, x_dim, y_dim, z_dim)):
+        cli_reader = ReaderConfig(
+            reference_latitude=reference_latitude,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            z_dim=z_dim,
+        )
+    reader = cli_reader or (cfg_vec.reader if cfg_vec else None)
+
     return {
         "input_path": effective_input,
         "output_path": effective_output,
@@ -356,6 +392,7 @@ def _resolve_vector_args(
         "seed": int(pick(seed, "seed")),
         "emit_field": bool(pick(emit_field, "emit_field")),
         "field_step": int(pick(field_step, "field_step")),
+        "reader": reader,
     }
 
 
@@ -376,11 +413,12 @@ def _run_vector(
     overwrite: bool,
     emit_field: bool,
     field_step: int,
+    reader: ReaderConfig | None = None,
 ) -> dict:
     """Shared vector-generation core used by both the ``vector`` and ``run`` commands."""
 
     try:
-        dataset = _load_vector_dataset(input_path, field_u, field_v, field_w)
+        dataset = _load_vector_dataset(input_path, field_u, field_v, field_w, reader=reader)
         parsed_step = _parse_step(step) if isinstance(step, str) else step
         result = build_vector_overlay(
             dataset,
@@ -426,12 +464,12 @@ def _run_vector(
 
 
 def _load_vector_dataset(
-    input_path: Path, field_u: str, field_v: str, field_w: str
+    input_path: Path, field_u: str, field_v: str, field_w: str, reader: ReaderConfig | None = None
 ) -> StructuredVoxelDataset:
     """Load three velocity components into one structured dataset."""
 
     loaded = [
-        read_vti(input_path, field_name=name, association=ScalarAssociation.POINT)
+        read_dataset(input_path, field_name=name, association=ScalarAssociation.POINT, reader=reader)
         for name in (field_u, field_v, field_w)
     ]
     base = loaded[0]
@@ -461,6 +499,10 @@ def _build_convert_config(
     source_max: float | None,
     non_finite: str | None,
     fill_value: float | None,
+    reference_latitude: float | None = None,
+    x_dim: str | None = None,
+    y_dim: str | None = None,
+    z_dim: str | None = None,
     available_levels: int | None,
     tile_dimensions: str | None,
     overwrite: bool,
@@ -521,6 +563,13 @@ def _build_convert_config(
     tiling = _build_tiling_config(available_levels, tile_dimensions)
     if tiling is not None:
         data["tiling"] = tiling.model_dump()
+    if any(v is not None for v in (reference_latitude, x_dim, y_dim, z_dim)):
+        data["reader"] = ReaderConfig(
+            reference_latitude=reference_latitude,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            z_dim=z_dim,
+        ).model_dump()
     return ConvertConfig.model_validate(data)
 
 
@@ -624,6 +673,10 @@ def run_command(
     config_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
     overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
     no_viewer: Annotated[bool, typer.Option("--no-viewer")] = False,
+    reference_latitude: Annotated[float | None, typer.Option("--reference-latitude", help="Reference latitude (deg) for lon->metre conversion (NetCDF/GeoTIFF).")] = None,
+    x_dim: Annotated[str | None, typer.Option("--x-dim")] = None,
+    y_dim: Annotated[str | None, typer.Option("--y-dim")] = None,
+    z_dim: Annotated[str | None, typer.Option("--z-dim")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     """End-to-end pipeline: read one YAML config and run convert -> vector -> deploy.
@@ -636,6 +689,17 @@ def run_command(
         config = PipelineConfig.from_yaml(config_path)
     except (OSError, ValueError, ValidationError) as error:
         _fail(str(error), EXIT_USAGE)
+
+    # CLI reader hints override the shared pipeline reader (if any).
+    if any(v is not None for v in (reference_latitude, x_dim, y_dim, z_dim)):
+        config = config.with_reader(
+            ReaderConfig(
+                reference_latitude=reference_latitude,
+                x_dim=x_dim,
+                y_dim=y_dim,
+                z_dim=z_dim,
+            )
+        )
 
     # 1) 体素生产（与 vector 共享同一 georeference）
     convert_cfg = config.convert_config(overwrite=overwrite)
@@ -664,6 +728,7 @@ def run_command(
         overwrite=overwrite,
         emit_field=config.vector.emit_field,
         field_step=config.vector.field_step,
+        reader=config.vector.reader or config.reader,
     )
 
     # 3) 部署自包含查看器
